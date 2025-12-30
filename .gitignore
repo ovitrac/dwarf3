@@ -225,6 +225,8 @@ $RECYCLE.BIN/
 *.jpeg
 !docs/images/*.png
 !docs/images/*.jpg
+!docs/assets/*.png
+!docs/assets/*.jpg
 
 # Temporary files
 *.tmp
