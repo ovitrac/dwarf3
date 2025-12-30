@@ -1,0 +1,259 @@
+# =============================================================================
+# dwarf3 - .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Project-specific exclusions
+# -----------------------------------------------------------------------------
+
+# Personal/private files
+perso/
+
+# Working documents (not for repo)
+TODO*.md
+REVIEW*.md
+DEBUG.md
+FOR_REVIEW*.md
+CONTEXT_SUMMARY.md
+ROADMAP.md
+aml_ffmpeg_text_overlay.py
+overlay.yaml
+M31.md
+CLAUDE.md
+old/
+
+# Raw data (large, user-specific)
+rawData/
+
+# Processed outputs (generated, large)
+processedData/
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# PEP 582
+__pypackages__/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# -----------------------------------------------------------------------------
+# Jupyter Notebook
+# -----------------------------------------------------------------------------
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints/
+
+# IPython
+profile_default/
+ipython_config.py
+
+# -----------------------------------------------------------------------------
+# IDEs and Editors
+# -----------------------------------------------------------------------------
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Spyder
+.spyderproject
+.spyproject
+
+# Rope
+.ropeproject
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+*.swp
+*.swo
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# -----------------------------------------------------------------------------
+# OS generated files
+# -----------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# -----------------------------------------------------------------------------
+# Data and artifacts
+# -----------------------------------------------------------------------------
+
+# Large data files
+*.fits
+*.fit
+*.fts
+!tests/fixtures/*.fits
+
+# Image outputs (keep test fixtures)
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+!docs/images/*.png
+!docs/images/*.jpg
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Log files
+*.log
+logs/
+
+# Cache directories
+.cache/
+cache/
+*.cache
+
+# -----------------------------------------------------------------------------
+# Documentation builds
+# -----------------------------------------------------------------------------
+docs/_build/
+site/
+
+# -----------------------------------------------------------------------------
+# Secrets and credentials (safety)
+# -----------------------------------------------------------------------------
+*.pem
+*.key
+.secrets
+secrets.json
+credentials.json
+.env.local
+.env.*.local

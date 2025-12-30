@@ -1,0 +1,10 @@
+numpy>=1.23
+scipy>=1.10
+astropy>=5.3
+photutils>=1.9
+scikit-image>=0.21
+reproject>=0.10
+tqdm>=4.66
+astroalign>=2.4
+imageio>=2.34
+

@@ -1,0 +1,32 @@
+# conda env create -f environment.yaml
+# conda activate dwarf-astro
+
+name: dwarf-astro
+channels:
+  - conda-forge
+dependencies:
+  # --- Core language ---
+  - python>=3.10,<3.13
+
+  # --- Scientific stack ---
+  - numpy>=1.23
+  - scipy>=1.10
+  - astropy>=5.3
+  - photutils>=1.9
+  - scikit-image>=0.21
+
+  # --- Astronomy utilities ---
+  - reproject>=0.10
+
+  # --- IO / utilities ---
+  - tqdm>=4.66
+
+  # --- FITS handling (astropy pulls cfitsio, but explicit is clearer) ---
+  - cfitsio
+
+  # --- pip-only packages ---
+  - pip
+  - pip:
+      - astroalign>=2.4
+      - imageio>=2.34
+
