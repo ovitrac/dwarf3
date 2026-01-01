@@ -20,13 +20,13 @@ from pathlib import Path
 
 import numpy as np
 
-__version__ = "0.22.0-beta"
+__version__ = "0.23.0-rc1"
 __version_info__ = {
     "major": 0,
-    "minor": 22,
+    "minor": 23,
     "patch": 0,
-    "status": "beta",
-    "date": "2025-12-29",
+    "status": "rc1",
+    "date": "2026-01-01",
 }
 
 

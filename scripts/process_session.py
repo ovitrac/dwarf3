@@ -41,9 +41,11 @@ from dwarf3.debayer import debayer_rggb, bayer_luma_rggb
 from dwarf3.align import (
     select_reference_frame,
     align_frames_parallel,
+    align_rgb_debayer_first_parallel,
     save_transforms,
     load_transforms,
     apply_integer_shift as dwarf3_apply_integer_shift,
+    analyze_field_rotation,
 )
 from dwarf3.stack import (
     sigma_clip_mean,
@@ -52,6 +54,7 @@ from dwarf3.stack import (
     stream_plane_stack,
 )
 from dwarf3.color import (
+    apply_ccm,
     calibrate_rgb,
     scnr_green,
     combine_lrgb,
@@ -161,9 +164,11 @@ def process_session(
     keep_fraction: float = 0.92,
     sigma: float = 3.0,
     eq_mode: bool = False,
+    eq_robust: bool = False,
     saturation_boost: float = 1.0,
     scnr_strength: float = 0.0,
     wb_method: str = "stars",
+    ccm_preset: str = "rich",
     workers: int | None = None,
     skip_alignment: bool = False,
 ) -> dict:
@@ -181,13 +186,17 @@ def process_session(
     sigma : float
         Sigma clipping threshold.
     eq_mode : bool
-        If True, use EQ mode (integer-pixel alignment).
+        If True, use EQ mode (auto-switches to robust if needed).
+    eq_robust : bool
+        If True, force robust plane-based alignment even for EQ.
     saturation_boost : float
         Saturation multiplier (1.0 = unchanged, 1.3 = 30% boost).
     scnr_strength : float
         SCNR green reduction (0 = off, 0.3-0.5 = typical).
     wb_method : str
-        White balance method ('stars', 'gray_world', 'none').
+        White balance method ('stars', 'gray_world', 'background', 'none').
+    ccm_preset : str
+        Color Correction Matrix preset ('none', 'neutral', 'rich', 'vivid', 'ha_emission').
     workers : int, optional
         Number of parallel workers.
     skip_alignment : bool
@@ -211,7 +220,7 @@ def process_session(
     logger.info(get_version_banner())
     logger.info("=" * 60)
     logger.info("Processing session: %s", session_name)
-    logger.info("Mode: %s", "EQ (integer shifts)" if eq_mode else "Alt-Az (full affine)")
+    logger.info("Mode: %s", "EQ (auto)" if eq_mode else "Alt-Az (full affine)")
     logger.info("=" * 60)
 
     start_time = time.time()
@@ -283,23 +292,49 @@ def process_session(
     logger.info("\n[3/6] Computing alignment transforms...")
     transforms_file = cache_dir / "transforms.json"
 
+    # Select reference frame (best quality)
+    kept_paths = [Path(p) for p in kept_frames]
+    ref_path, ref_data_bayer = select_reference_frame(kept_paths, scores=kept_scores, method="best")
+    ref_path = str(ref_path)
+    logger.info("Reference frame: %s", Path(ref_path).name)
+
+    # Determine alignment strategy
+    detected_rotation = 0.0
+    use_robust_eq = False
+
+    if eq_mode:
+        if eq_robust:
+            logger.info("EQ-Robust mode requested: forcing plane-based affine alignment")
+            use_robust_eq = True
+        else:
+            # Auto-detect rotation
+            logger.info("Analyzing field rotation (sample size=5)...")
+            detected_rotation = analyze_field_rotation(kept_paths, ref_path)
+            logger.info("Detected max rotation: %.3f°", detected_rotation)
+            
+            if detected_rotation > 0.1:
+                logger.warning("Rotation > 0.1° detected! Switching to Robust EQ (Plane-Based Affine).")
+                use_robust_eq = True
+            else:
+                logger.info("Rotation negligible (< 0.1°). Using fast Integer EQ.")
+                use_robust_eq = False
+
     if transforms_file.exists() and skip_alignment:
         logger.info("Loading cached transforms...")
-        transforms_data, ref_path, _ = load_transforms(transforms_file)
+        transforms_data, _, _ = load_transforms(transforms_file)
         # Filter to kept frames
         transforms = [t for t in transforms_data if t.source_path in kept_frames or not t.source_path]
     else:
-        # Select reference frame (best quality)
-        kept_paths = [Path(p) for p in kept_frames]
-        ref_path, ref_data = select_reference_frame(kept_paths, scores=kept_scores, method="best")
-        ref_path = str(ref_path)
-        logger.info("Reference frame: %s", Path(ref_path).name)
+        # Pre-debayer reference for robust alignment (superpixel is fine for alignment)
+        ref_rgb_super = debayer_rggb(ref_data_bayer, mode="superpixel")
 
-        # Compute transforms using parallel alignment
-        aligned_frames, all_results = align_frames_parallel(
+        # Compute transforms using robust RGB alignment (superpixel proxy)
+        # This handles rotation correctly even if we later round to integers
+        aligned_frames, all_results, _ = align_rgb_debayer_first_parallel(
             [Path(p) for p in kept_frames],
-            reference_data=ref_data,
+            reference_rgb=ref_rgb_super,
             reference_path=ref_path,
+            debayer_mode="superpixel", # Fast and robust
             workers=workers,
         )
 
@@ -312,12 +347,14 @@ def process_session(
         logger.info("Alignment: %d succeeded, %d failed",
                     len(transforms), len(failures))
 
-    # For EQ mode, round transforms to integer pixels
-    if eq_mode:
-        logger.info("EQ mode: rounding transforms to even-pixel shifts...")
+    # Apply EQ-specific rounding if NOT using robust mode
+    if eq_mode and not use_robust_eq:
+        logger.info("EQ mode (Standard): rounding transforms to even-pixel shifts...")
         for t in transforms:
             if t.matrix is not None:
                 t.matrix = round_transform_to_integer(t.matrix)
+    elif eq_mode and use_robust_eq:
+        logger.info("EQ mode (Robust): preserving affine rotation/scale")
 
     # Step 4: Stack using plane-based approach (preserves color)
     logger.info("\n[4/6] Stacking frames with plane-based approach...")
@@ -416,6 +453,17 @@ def process_session(
     logger.info("White balance: R=%.3f, G=%.3f, B=%.3f",
                 cal_params.wb_gain_r, cal_params.wb_gain_g, cal_params.wb_gain_b)
 
+    # Apply Color Correction Matrix (CCM) to restore color saturation
+    # CCM transforms Camera RGB to sRGB, correcting for sensor spectral response
+    if ccm_preset and ccm_preset.lower() != "none":
+        logger.info("Applying Color Correction Matrix: %s", ccm_preset)
+        calibrated_rgb = apply_ccm(
+            calibrated_rgb,
+            matrix=ccm_preset,
+            clip_negatives=True,
+            preserve_luminance=True,
+        )
+
     # Apply SCNR if requested
     if scnr_strength > 0:
         logger.info("Applying SCNR green reduction (strength=%.2f)...", scnr_strength)
@@ -499,6 +547,10 @@ def process_session(
         "session_id": session_name,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "eq" if eq_mode else "altaz",
+        "alignment": {
+            "rotation_deg": detected_rotation,
+            "strategy": "robust_affine" if use_robust_eq else "integer_shift",
+        },
         "summary": {
             "frames_discovered": n_discovered,
             "frames_kept": len(kept_frames),
@@ -512,6 +564,7 @@ def process_session(
             "wb_r": float(cal_params.wb_gain_r),
             "wb_g": float(cal_params.wb_gain_g),
             "wb_b": float(cal_params.wb_gain_b),
+            "ccm_preset": ccm_preset if ccm_preset else "none",
             "saturation_boost": float(saturation_boost),
             "scnr_strength": float(scnr_strength),
         },
@@ -540,6 +593,8 @@ def process_session(
         f.write(f"| Frames discovered | {n_discovered} |\n")
         f.write(f"| Frames kept | {len(kept_frames)} |\n")
         f.write(f"| Frames stacked | {len(valid_paths)} |\n")
+        f.write(f"| Alignment strategy | {report_data['alignment']['strategy']} |\n")
+        f.write(f"| Detected rotation | {detected_rotation:.3f}° |\n")
         f.write(f"| Total exposure | {stats.total_exposure_s:.0f}s ({stats.total_exposure_s/60:.1f} min) |\n")
         f.write(f"| Processing time | {elapsed:.1f}s |\n")
         f.write(f"| SNR proxy | {stats.snr_proxy:.1f} |\n\n")
@@ -574,17 +629,20 @@ def main():
         epilog="""
 Examples:
   # Process M31 (Alt-Az mode, rotation handling)
-  python scripts/process_session.py rawData/DWARF_RAW_TELE_M\\ 31_*
+  python scripts/process_session.py rawData/DWARF_RAW_TELE_M\ 31_*
 
-  # Process M43 (EQ mode, integer-pixel shifts)
-  python scripts/process_session.py rawData/DWARF_RAW_TELE_M\\ 43_* --eq-mode
+  # Process M43 (EQ mode, auto-switches if rotation > 0.1 deg)
+  python scripts/process_session.py rawData/DWARF_RAW_TELE_M\ 43_* --eq-mode
+
+  # Force robust alignment for EQ (always checks rotation)
+  python scripts/process_session.py <session> --eq-mode --eq-robust
 
   # Enhanced colors
   python scripts/process_session.py <session> --saturation 1.3 --scnr 0.3
 
 Mount Modes:
   Alt-Az:  Significant field rotation. Uses debayer-first + affine transforms.
-  EQ:      Minimal rotation. Uses integer-pixel Bayer-safe shifts.
+  EQ:      Minimal rotation. Uses integer-pixel Bayer-safe shifts (or robust if needed).
         """,
     )
     parser.add_argument("session", type=Path, help="Path to raw session folder")
@@ -596,12 +654,16 @@ Mount Modes:
                         help="Sigma clipping threshold (default: 3.0)")
     parser.add_argument("--eq-mode", action="store_true",
                         help="Use EQ mode (integer-pixel alignment)")
+    parser.add_argument("--eq-robust", action="store_true",
+                        help="Force robust alignment for EQ mode (handles residual rotation)")
     parser.add_argument("--saturation", type=float, default=1.0,
                         help="Saturation boost factor (default: 1.0)")
     parser.add_argument("--scnr", type=float, default=0.0,
                         help="SCNR green reduction strength (default: 0, off)")
     parser.add_argument("--wb", choices=["stars", "gray_world", "background", "none"],
                         default="background", help="White balance method (default: background)")
+    parser.add_argument("--ccm", choices=["none", "neutral", "rich", "vivid", "ha_emission"],
+                        default="rich", help="Color Correction Matrix preset (default: rich)")
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of parallel workers (default: auto)")
     parser.add_argument("--skip-align", action="store_true",
@@ -625,9 +687,11 @@ Mount Modes:
             keep_fraction=args.keep,
             sigma=args.sigma,
             eq_mode=args.eq_mode,
+            eq_robust=args.eq_robust,
             saturation_boost=args.saturation,
             scnr_strength=args.scnr,
             wb_method=args.wb,
+            ccm_preset=args.ccm,
             workers=args.workers,
             skip_alignment=args.skip_align,
         )

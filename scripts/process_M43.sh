@@ -2,12 +2,28 @@
 # Process M43 (De Mairan's Nebula / Orion region) - EQ mode
 #
 # Session: DWARF_RAW_TELE_M 43_EXP_60_GAIN_60_2025-12-28-21-44-39-627
-# Frames: 60 discovered, ~55 stacked
+# Frames: 60 discovered, 55 stacked (92%)
 # Exposure: 60s x 55 = 55 min total
 # Mode: EQ (equatorial mount - integer-pixel shifts preserve Bayer grid)
 #
 # Note: M43 is an emission/reflection nebula. Use --wb background to avoid
 # overcorrecting the natural red H-alpha signal.
+#
+# dwarf3 v0.23.0-rc1 Test Results (2026-01-01)
+# --------------------------------------------
+# EQ Auto-Detection Test: PASSED
+#   - Field rotation measured: 0.066° (sampled from 5 frames)
+#   - Threshold: 0.1° -> correctly selected Integer EQ mode
+#   - Processing time: 3.6 minutes (fast integer shifts)
+#   - CCM preset: "rich" (default) - enhanced color saturation
+#   - White balance applied: background method
+#
+# New v0.23.0-rc1 Features Used:
+#   --eq-mode        Now auto-detects rotation and selects optimal method:
+#                    < 0.1°: Integer EQ (fast, Bayer-preserving)
+#                    >= 0.1°: Robust EQ (plane-based affine)
+#   --ccm PRESET     Color Correction Matrix for sRGB conversion:
+#                    neutral, rich (default), vivid, ha_emission
 #
 # Author: Olivier Vitrac, PhD, HDR
 #         Generative Simulation Initiative
@@ -24,6 +40,7 @@ usage() {
     echo "  --workers N     Number of parallel workers (default: 8)"
     echo "  --saturation F  Saturation boost factor (default: 1.4)"
     echo "  --wb METHOD     White balance: background|stars|gray_world|none"
+    echo "  --ccm PRESET    Color correction: neutral|rich|vivid|ha_emission (default: rich)"
     echo "  -v, --verbose   Verbose logging"
     echo "  -h, --help      Show this help"
     echo ""
@@ -47,7 +64,8 @@ SESSION="rawData/DWARF_RAW_TELE_M 43_EXP_60_GAIN_60_2025-12-28-21-44-39-627"
 
 echo "=============================================="
 echo "Processing M43 (De Mairan's Nebula)"
-echo "Mode: EQ (integer-pixel Bayer-safe alignment)"
+echo "Mode: EQ (auto-detects rotation, uses integer shifts if < 0.1°)"
+echo "dwarf3 v0.23.0-rc1"
 echo "=============================================="
 
 python3 scripts/process_session.py "$SESSION" \

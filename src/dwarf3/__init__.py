@@ -51,6 +51,7 @@ from .align import (
     align_rgb_debayer_first_parallel,
     align_rgb_debayer_first_shm,
     align_rgb_frames,
+    analyze_field_rotation,
     apply_cached_transforms,
     apply_integer_shift,
     apply_transform_to_image,
@@ -130,9 +131,11 @@ from .cache import (
 
 # Color processing (LRGB workflow)
 from .color import (
+    CCM_PRESETS,
     ColorCalibration,
     LRGBResult,
     apply_bayer_compensation,
+    apply_ccm,
     calibrate_rgb,
     combine_lrgb,
     compute_white_balance,
@@ -174,6 +177,7 @@ __all__ = [
     "align_rgb_debayer_first_parallel",
     "align_rgb_debayer_first_shm",
     "align_rgb_frames",
+    "analyze_field_rotation",
     "apply_cached_transforms",
     "apply_integer_shift",
     "estimate_integer_shift",
@@ -231,9 +235,11 @@ __all__ = [
     "CacheManifest",
     "get_session_cache",
     # Color / LRGB
+    "CCM_PRESETS",
     "ColorCalibration",
     "LRGBResult",
     "apply_bayer_compensation",
+    "apply_ccm",
     "calibrate_rgb",
     "combine_lrgb",
     "compute_white_balance",

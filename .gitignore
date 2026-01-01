@@ -13,13 +13,14 @@ perso/
 TODO*.md
 REVIEW*.md
 DEBUG.md
-FOR_REVIEW*.md
+FOR*REVIEW*.md
 CONTEXT_SUMMARY.md
 ROADMAP.md
 aml_ffmpeg_text_overlay.py
 overlay.yaml
 M31.md
 CLAUDE.md
+GEMINI.md
 old/
 
 # Raw data (large, user-specific)

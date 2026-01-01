@@ -4,8 +4,8 @@
 
 # METHODS.md — dwarf3 Processing Algorithms
 
-**Version:** 0.22.0-beta
-**Last Updated:** 2025-12-29
+**Version:** 0.23.0-rc1
+**Last Updated:** 2026-01-01
 
 This document provides detailed descriptions of all processing algorithms used in the `dwarf3` library. It is intended for reproducibility, scientific review, and citation.
 
@@ -138,9 +138,9 @@ DWARF 3 supports two tracking modes that fundamentally affect how frames must be
 
 **Field Rotation Formula:**
 
-$$\omega = \frac{15'' \cos\phi \cos A}{\cos h}$$
+$$\omega = \frac{15'' \cosϕ \cos A}{\cos h}$$
 
-Where $\phi$ is observer latitude, $A$ is azimuth, and $h$ is altitude. For M31 at mid-latitudes over 2.5 hours, rotation can exceed 80°.
+Where $ϕ$ is observer latitude, $A$ is azimuth, and $h$ is altitude. For M31 at mid-latitudes over 2.5 hours, rotation can exceed 80°.
 
 **Processing Strategy:**
 1. **Debayer first** — Convert Bayer mosaic to RGB before alignment
@@ -169,12 +169,23 @@ python scripts/process_session.py "rawData/DWARF_RAW_TELE_M 31_..." \
 - No field rotation (or minimal, if polar alignment is imperfect)
 - Frame shifts are primarily translation with negligible rotation
 
-**Processing Strategy:**
-1. **Integer-pixel Bayer-safe alignment** — Round shifts to even pixel values
-2. **Stack in Bayer domain** — Preserve raw sensor data through stacking
-3. **Debayer once** — Apply debayer only to final stacked result
+**Processing Strategy (Auto-Adaptive):**
 
-**Bayer Grid Preservation:**
+The pipeline automatically detects if robust alignment is needed by checking field rotation on a subset of frames.
+
+1. **Strict EQ (Rotation < 0.1°):**
+   - **Integer-pixel Bayer-safe alignment:** Round shifts to even pixel values.
+   - **Stack in Bayer domain:** Preserve raw sensor data through stacking.
+   - **Debayer once:** Apply debayer only to final stacked result.
+   - *Advantage:* Maximum sharpness and color fidelity.
+
+2. **Robust EQ (Rotation > 0.1°):**
+   - **Plane-based Affine Alignment:** Compute affine transforms but apply them to separated Bayer planes (R, G1, G2, B) independently.
+   - **Stack Planes:** Stack 4 separate planes with rotation support.
+   - **Debayer Once:** Demosaic the stacked planes.
+   - *Advantage:* Handles residual rotation while maintaining full resolution (unlike standard Alt-Az).
+
+**Bayer Grid Preservation (Strict EQ):**
 
 The RGGB pattern repeats every 2 pixels. To preserve color integrity:
 
@@ -185,9 +196,12 @@ $$\Delta y_{\text{aligned}} = 2 \times \text{round}\left(\frac{\Delta y_{\text{c
 This ensures R pixels always align with R pixels, G with G, B with B.
 
 ```bash
-# EQ mode processing
+# EQ mode processing (smart auto-detect)
 python scripts/process_session.py "rawData/DWARF_RAW_TELE_M 43_..." \
     --out processedData --keep 0.92 --sigma 3.0 --eq-mode
+
+# Force robust mode (if you know rotation is an issue)
+python scripts/process_session.py ... --eq-mode --eq-robust
 ```
 
 **Advantages:**
@@ -328,9 +342,9 @@ Implementation uses `ProcessPoolExecutor` with worker functions that:
 
 DWARF 3 uses an alt-azimuth mount, causing field rotation during long sessions:
 
-$$\theta(t) = \arctan\left(\frac{\cos\phi \sin h}{\sin\phi \cos\delta - \cos\phi \sin\delta \cos h}\right)$$
+$$\theta(t) = \arctan\left(\frac{\cosϕ \sin h}{\sinϕ \cosδ - \cosϕ \sinδ \cos h}\right)$$
 
-Where $\phi$ is latitude, $\delta$ is declination, and $h$ is hour angle.
+Where $ϕ$ is latitude, $δ$ is declination, and $h$ is hour angle.
 
 For M31 at typical mid-latitude locations, rotation can exceed 80° over a 2.5-hour session. This requires:
 - Full affine registration (not just translation)
@@ -447,7 +461,47 @@ gains = compute_white_balance(rgb, method="gray_world")
 rgb_wb = calibrate_rgb(rgb, gains)
 ```
 
-### 8.3 SCNR (Green Cast Removal)
+### 8.3 Color Correction Matrix (CCM)
+
+The CCM transforms Camera RGB to sRGB, correcting for sensor spectral response. Without this step, colors appear desaturated because sensor primaries don't match display primaries.
+
+**Problem:** Raw sensor data is in "Camera RGB" color space where spectral sensitivities overlap. This causes channel crosstalk that desaturates colors.
+
+**Solution:** Apply a 3×3 matrix that "un-mixes" the channels:
+
+$$\begin{pmatrix} R_{sRGB} \\ G_{sRGB} \\ B_{sRGB} \end{pmatrix} = \mathbf{M} \cdot \begin{pmatrix} R_{cam} \\ G_{cam} \\ B_{cam} \end{pmatrix}$$
+
+**Available Presets:**
+
+| Preset | Description | Use Case |
+|--------|-------------|----------|
+| `neutral` | Identity matrix (no correction) | Debugging, comparison |
+| `rich` | High saturation for Sony IMX | General astrophotography |
+| `vivid` | Aggressive color separation | Low-saturation targets |
+| `ha_emission` | Protects red channel | Emission nebulae (M42, M43) |
+
+**Rich Matrix (default):**
+
+$$\mathbf{M}_{rich} = \begin{pmatrix} 1.45 & -0.35 & -0.10 \\ -0.15 & 1.35 & -0.20 \\ -0.05 & -0.25 & 1.30 \end{pmatrix}$$
+
+Row sums equal 1.0 to preserve neutral grays.
+
+```python
+from dwarf3 import apply_ccm
+
+# Use preset
+rgb_ccm = apply_ccm(rgb_wb, matrix="rich")
+
+# Custom matrix with saturation boost
+rgb_ccm = apply_ccm(rgb_wb, matrix="rich", saturation_boost=1.2)
+
+# Ha-emission for nebulae
+rgb_ccm = apply_ccm(rgb_wb, matrix="ha_emission")
+```
+
+**Integration order:** CCM must be applied AFTER white balance and BEFORE non-linear stretch (asinh, gamma).
+
+### 8.4 SCNR (Green Cast Removal)
 
 Subtractive Chromatic Noise Reduction for residual green cast:
 
@@ -462,7 +516,7 @@ rgb_clean = scnr_green(rgb, amount=0.5)
 
 $$G' = G - \text{amount} \cdot (G - \max(R, B))$$
 
-### 8.4 LAB Color Space Correction
+### 8.5 LAB Color Space Correction
 
 For fine color tuning, LAB color space provides independent control:
 
@@ -528,7 +582,7 @@ normalized = linear_stretch(data, low_pct=1.0, high_pct=99.5)
 
 ### 9.3 Two-Stage Stretch
 
-For challenging data (faint nebulae with bright stars):
+For challenging data (faint nebulosity with bright stars):
 
 1. **Stage 1:** Gentle background stretch (low $a$)
 2. **Stage 2:** Stronger highlight compression (higher $a$)
@@ -657,4 +711,4 @@ lrgb = combine_lrgb(luminance, rgb, lum_weight=0.7)
 
 ---
 
-*Document version: 0.22.0-beta (2025-12-29)*
+*Document version: 0.23.0-rc1 (2026-01-01)*

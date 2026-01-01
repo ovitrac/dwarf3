@@ -32,6 +32,45 @@ from scipy import ndimage
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Color Correction Matrix (CCM) Presets
+# =============================================================================
+# Row sums should be 1.0 to preserve luminance on neutral tones.
+# These matrices transform Camera RGB to display-ready sRGB.
+
+CCM_PRESETS: dict[str, np.ndarray] = {
+    # Identity matrix (no color correction)
+    "neutral": np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float32),
+
+    # Generic "Rich" for Sony IMX sensors (high saturation)
+    # Subtracts channel crosstalk to restore color separation
+    "rich": np.array([
+        [ 1.45, -0.35, -0.10],
+        [-0.15,  1.35, -0.20],
+        [-0.05, -0.25,  1.30]
+    ], dtype=np.float32),
+
+    # More aggressive color separation (vivid colors)
+    "vivid": np.array([
+        [ 1.60, -0.40, -0.20],
+        [-0.20,  1.60, -0.40],
+        [-0.10, -0.30,  1.40]
+    ], dtype=np.float32),
+
+    # Ha-emission focused: Protects Red channel from excessive subtraction
+    # Useful when Red signal is dominant/narrowband (emission nebulae)
+    "ha_emission": np.array([
+        [ 1.10, -0.10,  0.00],
+        [-0.10,  1.10,  0.00],
+        [ 0.00,  0.00,  1.00]
+    ], dtype=np.float32),
+}
+
+
 @dataclass
 class ColorCalibration:
     """Color calibration parameters."""
@@ -145,6 +184,123 @@ def apply_bayer_compensation(
     )
 
     return result
+
+
+def apply_ccm(
+    rgb: np.ndarray,
+    matrix: np.ndarray | str | list | None = "rich",
+    saturation_boost: float = 1.0,
+    clip_negatives: bool = True,
+    preserve_luminance: bool = True,
+) -> np.ndarray:
+    """
+    Apply Color Correction Matrix (CCM) to convert Camera RGB to sRGB.
+
+    This step is essential for accurate color reproduction. Without it,
+    colors appear desaturated because sensor spectral response does not
+    match sRGB primaries. The CCM "un-mixes" channel crosstalk.
+
+    Parameters
+    ----------
+    rgb : np.ndarray
+        RGB image (H, W, 3), linear data, white-balanced.
+    matrix : np.ndarray | str | list, default "rich"
+        3x3 Color Correction Matrix.
+        Can be a preset name: "neutral", "rich", "vivid", "ha_emission".
+        Or a 3x3 array/list for custom matrices.
+    saturation_boost : float, default 1.0
+        Scalar multiplier for matrix deviation from identity.
+        Values > 1.0 increase color separation (more saturated).
+        Values < 1.0 reduce color separation (less saturated).
+    clip_negatives : bool, default True
+        Clip output values < 0 to 0 (essential for high saturation matrices).
+    preserve_luminance : bool, default True
+        Normalize matrix rows to sum to 1.0 to preserve neutral gray levels.
+
+    Returns
+    -------
+    np.ndarray
+        Color-corrected RGB image (Linear sRGB).
+
+    Examples
+    --------
+    >>> # Use "rich" preset (default)
+    >>> rgb_corrected = apply_ccm(rgb_wb)
+
+    >>> # Use "ha_emission" for emission nebulae
+    >>> rgb_corrected = apply_ccm(rgb_wb, matrix="ha_emission")
+
+    >>> # Custom matrix
+    >>> custom = [[1.5, -0.3, -0.2], [-0.1, 1.4, -0.3], [0.0, -0.2, 1.2]]
+    >>> rgb_corrected = apply_ccm(rgb_wb, matrix=custom)
+
+    Notes
+    -----
+    The CCM should be applied AFTER white balance and BEFORE non-linear
+    stretch (asinh, gamma). The input must be white-balanced so that
+    neutral objects have R ≈ G ≈ B.
+
+    Row sums of 1.0 ensure that neutral colors (R=G=B) remain neutral
+    after transformation. This is verified/enforced when preserve_luminance=True.
+    """
+    # 1. Resolve matrix from preset name or array
+    if isinstance(matrix, str):
+        if matrix not in CCM_PRESETS:
+            available = list(CCM_PRESETS.keys())
+            raise ValueError(f"Unknown CCM preset: '{matrix}'. Available: {available}")
+        ccm = CCM_PRESETS[matrix].copy()
+        matrix_name = matrix
+    elif matrix is None:
+        ccm = CCM_PRESETS["rich"].copy()
+        matrix_name = "rich"
+    else:
+        ccm = np.array(matrix, dtype=np.float32)
+        matrix_name = "custom"
+
+    if ccm.shape != (3, 3):
+        raise ValueError(f"CCM must be 3x3, got shape {ccm.shape}")
+
+    # 2. Apply saturation boost (deviation from identity)
+    if saturation_boost != 1.0:
+        # M_new = I + boost * (M - I)
+        identity = np.eye(3, dtype=np.float32)
+        ccm = identity + saturation_boost * (ccm - identity)
+        logger.debug("CCM saturation boost applied: %.2fx", saturation_boost)
+
+    # 3. Validate/normalize row sums for luminance preservation
+    if preserve_luminance:
+        row_sums = ccm.sum(axis=1, keepdims=True)
+        # Avoid division by zero
+        row_sums = np.where(row_sums == 0, 1.0, row_sums)
+
+        if not np.allclose(row_sums, 1.0, atol=0.01):
+            logger.warning(
+                "CCM row sums deviate from 1.0: [%.3f, %.3f, %.3f]. Normalizing.",
+                row_sums[0, 0], row_sums[1, 0], row_sums[2, 0]
+            )
+            ccm = ccm / row_sums
+        else:
+            logger.debug("CCM row sums verified (preserve_luminance=True)")
+
+    # 4. Apply matrix transformation
+    h, w, c = rgb.shape
+    rgb_flat = rgb.reshape(-1, 3).astype(np.float32)
+
+    # Output = Input @ Matrix.T (each row of input multiplied by columns of M)
+    corrected_flat = rgb_flat @ ccm.T
+    corrected = corrected_flat.reshape(h, w, c)
+
+    # 5. Clip negative values (CCM can produce negatives for out-of-gamut colors)
+    if clip_negatives:
+        n_negative = np.sum(corrected < 0)
+        if n_negative > 0:
+            logger.debug("Clipping %d negative values (%.2f%%)",
+                        n_negative, 100 * n_negative / corrected.size)
+        corrected = np.maximum(corrected, 0)
+
+    logger.info("Applied CCM: %s (saturation_boost=%.2f)", matrix_name, saturation_boost)
+
+    return corrected.astype(np.float32)
 
 
 def compute_common_footprint(

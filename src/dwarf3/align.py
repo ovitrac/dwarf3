@@ -344,6 +344,83 @@ def apply_cached_transforms(
     return aligned_frames, all_results
 
 
+def analyze_field_rotation(
+    frame_paths: list[str | Path],
+    ref_path: str | Path,
+    sample_size: int = 5
+) -> float:
+    """
+    Estimate max field rotation in degrees using a sample of frames.
+
+    This helps determine if robust affine alignment is needed (rotation > 0.1°)
+    or if faster integer alignment is sufficient (rotation ≈ 0°).
+
+    Parameters
+    ----------
+    frame_paths : list[str | Path]
+        List of all frame paths.
+    ref_path : str | Path
+        Path to the reference frame.
+    sample_size : int, default 5
+        Number of frames to sample (distributed evenly).
+
+    Returns
+    -------
+    float
+        Maximum detected rotation in degrees (absolute value).
+    """
+    if len(frame_paths) < 2:
+        return 0.0
+
+    # Ensure paths are Path objects
+    frames = [Path(p) for p in frame_paths]
+    ref = Path(ref_path)
+
+    # Read reference luminance (superpixel for speed)
+    try:
+        ref_luma = bayer_luma_rggb(read_fits(ref))
+    except Exception as e:
+        logger.warning("Could not read reference for rotation check: %s", e)
+        return 0.0
+
+    max_rotation = 0.0
+    
+    # Select sample indices (start, end, and middle points)
+    indices = np.linspace(0, len(frames) - 1, sample_size, dtype=int)
+    
+    for idx in indices:
+        fpath = frames[idx]
+        if fpath == ref:
+            continue
+            
+        try:
+            luma = bayer_luma_rggb(read_fits(fpath))
+            transform = find_transform(luma, ref_luma)
+            
+            if transform.success and transform.matrix is not None:
+                # Extract rotation from affine matrix
+                # Matrix is [[a, b, tx], [c, d, ty]]
+                # rotation = arctan2(b, a)
+                # Note: skimage/astroalign matrices are typically [a b tx; c d ty]
+                # row 0: x' = ax + by + tx -> a=cos, b=-sin? No, depends on convention.
+                # astroalign returns scikit-image compatible transform.
+                # Rotation is arctan2(M[1,0], M[0,0]) usually
+                
+                # Using standard decomposition:
+                # sx = sqrt(a^2 + c^2)
+                # theta = atan2(c, a) = atan2(M[1,0], M[0,0])
+                rotation_rad = np.arctan2(transform.matrix[1, 0], transform.matrix[0, 0])
+                rotation_deg = np.abs(np.degrees(rotation_rad))
+                
+                if rotation_deg > max_rotation:
+                    max_rotation = rotation_deg
+                    
+        except Exception:
+            continue
+            
+    return max_rotation
+
+
 def register_to_reference(
     source: np.ndarray,
     reference: np.ndarray,
@@ -2002,8 +2079,8 @@ def _init_shm_worker(
     mask_shape: tuple,
     ref_shape: tuple,
     debayer_mode: str,
-) -> None:
-    """Initialize worker with shared memory references."""
+):
+    """Initialize shared memory for worker process."""
     global _shm_rgb, _shm_mask, _shm_ref_lum
     global _aligned_rgb_view, _masks_view, _ref_lum_view
     global _worker_rgb_shape, _worker_mask_shape, _worker_debayer_mode
@@ -2012,63 +2089,91 @@ def _init_shm_worker(
     _worker_mask_shape = mask_shape
     _worker_debayer_mode = debayer_mode
 
-    # Attach to shared memory segments
+    # Connect to shared memory
     _shm_rgb = shared_memory.SharedMemory(name=shm_rgb_name)
     _shm_mask = shared_memory.SharedMemory(name=shm_mask_name)
     _shm_ref_lum = shared_memory.SharedMemory(name=shm_ref_name)
 
-    # Create numpy views into shared memory
+    # Create numpy views
     _aligned_rgb_view = np.ndarray(rgb_shape, dtype=np.float32, buffer=_shm_rgb.buf)
     _masks_view = np.ndarray(mask_shape, dtype=np.float32, buffer=_shm_mask.buf)
     _ref_lum_view = np.ndarray(ref_shape, dtype=np.float32, buffer=_shm_ref_lum.buf)
 
 
-def _align_shm_worker(args: tuple) -> tuple[int, int, bool, str, list | None]:
-    """
-    Worker function that writes directly to shared memory.
+def _align_shm_worker(args: tuple) -> AlignmentResult:
+    """Worker for shared memory alignment."""
+    # Note: Using globals for SHM access
+    frame_path, idx, reference_path = args
 
-    Returns (slot_idx, frame_idx, success, error_msg, matrix_list).
-    Matrix is returned as flat list (9 floats) - minimal pickle overhead.
-    Large RGB data is written directly to shared memory.
-    """
     from .debayer import debayer_rggb, luminance_from_rgb
-
-    frame_path, slot_idx, frame_idx = args
 
     try:
         # Read and debayer
         bayer = read_fits(frame_path)
         rgb = debayer_rggb(bayer, mode=_worker_debayer_mode)
-        del bayer
+        source_luma = luminance_from_rgb(rgb)
 
-        # Compute luminance for alignment
-        lum = luminance_from_rgb(rgb)
+        # Get reference from SHM
+        ref_luma = _ref_lum_view
 
-        # Find transform against reference luminance (in shared memory)
-        transform = find_transform(lum, _ref_lum_view)
-        del lum
-
-        if not transform.success:
-            del rgb
-            return (slot_idx, frame_idx, False, transform.error_message, None)
-
-        # Apply transform to RGB with validity mask
-        aligned_rgb, validity_mask = apply_transform_to_image(
-            rgb, transform.matrix, return_mask=True
+        # Find transform
+        transform = find_transform(
+            source_luma,
+            ref_luma,
+            source_path=str(frame_path),
+            reference_path=reference_path,
         )
-        del rgb
 
-        # Write DIRECTLY to shared memory (zero pickle overhead!)
-        _aligned_rgb_view[slot_idx] = aligned_rgb.astype(np.float32)
-        _masks_view[slot_idx] = validity_mask.astype(np.float32)
-
-        # Return matrix as flat list (9 floats, minimal pickle overhead)
-        matrix_list = transform.matrix.flatten().tolist()
-
-        return (slot_idx, frame_idx, True, "", matrix_list)
+        if transform.success:
+            # Apply transform to RGB and write directly to SHM
+            # We need to warp each channel
+            
+            # Use skimage warp with output parameter if possible?
+            # warp() returns a new array. We must copy it to SHM.
+            # To optimize, we could assume align_rgb_debayer_first_shm
+            # only needs the transform and we do the warp in main process?
+            # NO, the whole point is parallel warping.
+            
+            # Warp RGB
+            aligned_rgb, mask = apply_transform_to_image(
+                rgb,
+                transform.matrix,
+                output_shape=_worker_rgb_shape[1:], # H, W, 3
+                return_mask=True,
+            )
+            
+            # Write to SHM slice
+            _aligned_rgb_view[idx] = aligned_rgb
+            _masks_view[idx] = mask
+            
+            # Don't return data in result
+            return AlignmentResult(
+                path=str(frame_path),
+                success=True,
+                aligned_data=None,
+                transform=transform,
+            )
+        else:
+            return AlignmentResult(
+                path=str(frame_path),
+                success=False,
+                aligned_data=None,
+                transform=transform,
+            )
 
     except Exception as e:
-        return (slot_idx, frame_idx, False, str(e), None)
+        logger.error("SHM Worker failed for %s: %s", frame_path, e)
+        return AlignmentResult(
+            path=str(frame_path),
+            success=False,
+            aligned_data=None,
+            transform=AlignmentTransform(
+                source_path=str(frame_path),
+                reference_path=reference_path,
+                success=False,
+                error_message=str(e),
+            ),
+        )
 
 
 def align_rgb_debayer_first_shm(
@@ -2079,16 +2184,14 @@ def align_rgb_debayer_first_shm(
     max_failures: int = 50,
     show_progress: bool = True,
     workers: int | None = None,
-    on_aligned: Callable[[np.ndarray, np.ndarray, int], None] | None = None,
 ) -> tuple[list[np.ndarray], list[AlignmentResult], list[np.ndarray]]:
     """
-    Shared-memory parallel alignment with zero pickle overhead.
-
+    Shared-memory optimized parallel alignment.
+    
     This is significantly faster than align_rgb_debayer_first_parallel because:
-    - Workers write directly to shared memory
-    - Only small tuples (slot_idx, success) go through pickle
-    - ~10x speedup on multi-core systems
-
+    1. Reference image is put in shared memory (read once)
+    2. Workers write aligned images directly to shared memory (no pickling)
+    
     Parameters
     ----------
     frame_paths : list[Path]
@@ -2104,15 +2207,13 @@ def align_rgb_debayer_first_shm(
     show_progress : bool, default True
         Show progress bar.
     workers : int or None, default None
-        Number of parallel workers. None uses auto-detection (CPU count - 1).
-    on_aligned : callable, optional
-        Callback function(aligned_rgb, mask, frame_idx) called after each
-        successful alignment. Useful for online stacking.
+        Number of parallel workers. None uses auto-detection.
 
     Returns
     -------
     tuple[list[np.ndarray], list[AlignmentResult], list[np.ndarray]]
         (aligned_rgb_frames, all_results, validity_masks)
+        Note: The returned lists contain copies from SHM, so they are safe to use.
     """
     from .cli_output import create_progress_bar
     from .debayer import luminance_from_rgb
@@ -2121,231 +2222,111 @@ def align_rgb_debayer_first_shm(
         workers = DEFAULT_WORKERS
 
     n_frames = len(frame_paths)
-
-    # Fall back to sequential for small counts
-    if workers <= 1 or n_frames < 10:
-        return align_rgb_debayer_first(
-            frame_paths,
-            reference_rgb,
-            reference_path,
-            debayer_mode=debayer_mode,
-            max_failures=max_failures,
-            show_progress=show_progress,
-            return_masks=True,
+    
+    # Use standard method for small batches or if SHM fails
+    if n_frames < 5:
+        return align_rgb_debayer_first_parallel(
+            frame_paths, reference_rgb, reference_path,
+            debayer_mode, max_failures, show_progress, workers
         )
 
-    h, w, c = reference_rgb.shape
-
-    # Number of slots = 2x workers (double buffer)
-    n_slots = workers * 2
-
-    # Allocate shared memory
-    rgb_shape = (n_slots, h, w, c)
-    mask_shape = (n_slots, h, w)
-    ref_shape = (h, w)
-
-    rgb_nbytes = int(np.prod(rgb_shape) * 4)
-    mask_nbytes = int(np.prod(mask_shape) * 4)
-    ref_nbytes = int(np.prod(ref_shape) * 4)
-
-    total_shm_gb = (rgb_nbytes + mask_nbytes + ref_nbytes) / 1e9
-    logger.info(
-        "SHM parallel alignment: %d frames, %d workers, %.1f GB shared memory",
-        n_frames, workers, total_shm_gb
-    )
-
-    # Create shared memory segments
-    shm_rgb = shared_memory.SharedMemory(create=True, size=rgb_nbytes)
-    shm_mask = shared_memory.SharedMemory(create=True, size=mask_nbytes)
-    shm_ref = shared_memory.SharedMemory(create=True, size=ref_nbytes)
+    # 1. Prepare shared memory
+    ref_luma = luminance_from_rgb(reference_rgb)
+    
+    # Shapes
+    rgb_shape = (n_frames, *reference_rgb.shape)
+    mask_shape = (n_frames, *reference_rgb.shape[:2])
+    ref_shape = ref_luma.shape
+    
+    # Calculate bytes
+    rgb_bytes = int(np.prod(rgb_shape) * 4)  # float32
+    mask_bytes = int(np.prod(mask_shape) * 4)
+    ref_bytes = int(np.prod(ref_shape) * 4)
+    
+    total_mb = (rgb_bytes + mask_bytes + ref_bytes) / 1024 / 1024
+    logger.info("Allocating %.1f MB shared memory for alignment", total_mb)
+    
+    try:
+        shm_rgb = shared_memory.SharedMemory(create=True, size=rgb_bytes)
+        shm_mask = shared_memory.SharedMemory(create=True, size=mask_bytes)
+        shm_ref = shared_memory.SharedMemory(create=True, size=ref_bytes)
+    except Exception as e:
+        logger.warning("Failed to allocate shared memory: %s. Falling back to standard parallel.", e)
+        return align_rgb_debayer_first_parallel(
+            frame_paths, reference_rgb, reference_path,
+            debayer_mode, max_failures, show_progress, workers
+        )
 
     try:
-        # Write reference luminance to shared memory
-        ref_lum = luminance_from_rgb(reference_rgb).astype(np.float32)
-        ref_lum_view = np.ndarray(ref_shape, dtype=np.float32, buffer=shm_ref.buf)
-        ref_lum_view[:] = ref_lum
-
-        # Create views for main process
-        aligned_rgb_view = np.ndarray(rgb_shape, dtype=np.float32, buffer=shm_rgb.buf)
-        masks_view = np.ndarray(mask_shape, dtype=np.float32, buffer=shm_mask.buf)
-
-        aligned_frames = []
-        validity_masks = []
+        # Initialize ref in SHM
+        ref_view = np.ndarray(ref_shape, dtype=np.float32, buffer=shm_ref.buf)
+        ref_view[:] = ref_luma[:]
+        
+        # Prepare args
+        args_list = [
+            (path, i, reference_path) 
+            for i, path in enumerate(frame_paths)
+        ]
+        
         all_results = []
-        failed_count = 0
-
-        # Track slot usage (which slots have pending work)
-        slot_available = [True] * n_slots
-
-        pbar = create_progress_bar(
-            total=n_frames,
-            desc=f"SHM Align ({workers}w)",
-            unit="frame",
-            disable=not show_progress,
-        )
-
-        start_time = time.time()
-
-        with ProcessPoolExecutor(
-            max_workers=workers,
+        
+        # Start pool with initializer
+        from multiprocessing import Pool, get_context
+        ctx = get_context('spawn')
+        
+        with ctx.Pool(
+            processes=workers,
             initializer=_init_shm_worker,
             initargs=(
                 shm_rgb.name, shm_mask.name, shm_ref.name,
                 rgb_shape, mask_shape, ref_shape, debayer_mode
-            ),
-        ) as executor:
-
-            # Prepare work items with slot assignments
-            futures = {}
-            next_frame_idx = 0
-
-            def submit_next():
-                nonlocal next_frame_idx
-
-                if next_frame_idx >= n_frames:
-                    return False
-
-                # Find available slot
-                slot = None
-                for i in range(n_slots):
-                    if slot_available[i]:
-                        slot = i
-                        slot_available[i] = False
-                        break
-
-                if slot is None:
-                    return False
-
-                args = (frame_paths[next_frame_idx], slot, next_frame_idx)
-                future = executor.submit(_align_shm_worker, args)
-                futures[future] = (slot, next_frame_idx)
-                next_frame_idx += 1
-                return True
-
-            # Submit initial batch
-            for _ in range(min(n_slots, n_frames)):
-                submit_next()
-
-            # Timeout per frame (seconds) - prevents hanging on bad frames
-            FRAME_TIMEOUT = 60.0
-
-            from concurrent.futures import wait, FIRST_COMPLETED
-
+            )
+        ) as pool:
+            
+            pbar = create_progress_bar(
+                total=n_frames,
+                desc=f"SHM Align ({workers})",
+                unit="frame",
+                disable=not show_progress
+            )
+            
             with pbar:
-                while futures:
-                    # Wait for at least one future to complete (with timeout)
-                    done_set, _ = wait(futures.keys(), timeout=2.0, return_when=FIRST_COMPLETED)
-
-                    if not done_set:
-                        # Timeout - no futures completed yet, check for long-running jobs
-                        elapsed = time.time() - start_time
-                        if elapsed > 30 and len(all_results) < 10:
-                            logger.warning("Slow start: %d results after %.0fs", len(all_results), elapsed)
-                        continue
-
-                    # Process ALL completed futures
-                    for future in done_set:
-                        slot, frame_idx = futures.pop(future)
-
-                        try:
-                            ret_slot, ret_frame, success, error_msg, matrix_list = future.result(timeout=FRAME_TIMEOUT)
-
-                            if success:
-                                # Read from shared memory
-                                aligned_data = aligned_rgb_view[ret_slot].copy()
-                                mask_data = masks_view[ret_slot].copy()
-
-                                aligned_frames.append(aligned_data)
-                                validity_masks.append(mask_data)
-
-                                # Reconstruct transform matrix from flat list
-                                transform_matrix = np.array(matrix_list, dtype=np.float64).reshape(3, 3)
-
-                                result = AlignmentResult(
-                                    path=str(frame_paths[ret_frame]),
-                                    success=True,
-                                    aligned_data=None,
-                                    transform=AlignmentTransform(
-                                        source_path=str(frame_paths[ret_frame]),
-                                        reference_path=reference_path,
-                                        success=True,
-                                        matrix=transform_matrix,
-                                    ),
-                                )
-
-                                if on_aligned is not None:
-                                    on_aligned(aligned_data, mask_data, ret_frame)
-                            else:
-                                failed_count += 1
-                                result = AlignmentResult(
-                                    path=str(frame_paths[ret_frame]),
-                                    success=False,
-                                    aligned_data=None,
-                                    transform=AlignmentTransform(
-                                        source_path=str(frame_paths[ret_frame]),
-                                        reference_path=reference_path,
-                                        success=False,
-                                        error_message=error_msg,
-                                    ),
-                                )
-
-                            all_results.append(result)
-
-                        except Exception as e:
-                            failed_count += 1
-                            logger.error("Worker error for frame %d: %s", frame_idx, e)
-                            result = AlignmentResult(
-                                path=str(frame_paths[frame_idx]),
-                                success=False,
-                                aligned_data=None,
-                                transform=AlignmentTransform(
-                                    source_path=str(frame_paths[frame_idx]),
-                                    reference_path=reference_path,
-                                    success=False,
-                                    error_message=f"Worker error: {e}",
-                                ),
-                            )
-                            all_results.append(result)
-
-                        # Free slot and submit next job
-                        slot_available[slot] = True
-                        submit_next()
-
-                        # Update progress
-                        n_done = len(all_results)
-                        n_ok = len(aligned_frames)
-                        elapsed = time.time() - start_time
-                        fps = n_done / elapsed if elapsed > 0 else 0
-
-                        pbar.set_postfix(
-                            ok=n_ok,
-                            fail=failed_count,
-                            fps=f"{fps:.1f}",
-                        )
-                        pbar.update(1)
+                for result in pool.imap_unordered(_align_shm_worker, args_list):
+                    all_results.append(result)
+                    pbar.update(1)
+        
+        # Collect successful frames from SHM
+        # We need to sort results to match indices or just grab based on success
+        # The SHM was written by index, so aligned_frames[i] corresponds to frame_paths[i]
+        
+        aligned_frames = []
+        validity_masks = []
+        
+        # Read from SHM views (in main process)
+        shm_rgb_view = np.ndarray(rgb_shape, dtype=np.float32, buffer=shm_rgb.buf)
+        shm_mask_view = np.ndarray(mask_shape, dtype=np.float32, buffer=shm_mask.buf)
+        
+        # Map path back to result to check success
+        result_map = {r.path: r for r in all_results}
+        
+        success_count = 0
+        for i, path in enumerate(frame_paths):
+            res = result_map.get(str(path))
+            if res and res.success:
+                # Copy from SHM to local memory
+                aligned_frames.append(shm_rgb_view[i].copy())
+                validity_masks.append(shm_mask_view[i].copy())
+                success_count += 1
+                
+        logger.info("SHM alignment complete: %d/%d successful", success_count, n_frames)
+        
+        return aligned_frames, all_results, validity_masks
 
     finally:
-        # Cleanup shared memory
+        # cleanup
         shm_rgb.close()
         shm_rgb.unlink()
         shm_mask.close()
         shm_mask.unlink()
         shm_ref.close()
         shm_ref.unlink()
-
-    elapsed = time.time() - start_time
-    fps = n_frames / elapsed if elapsed > 0 else 0
-
-    n_success = len(aligned_frames)
-    logger.info(
-        "SHM alignment complete: %d/%d successful, %.1f fps, %.1fs total",
-        n_success, n_frames, fps, elapsed
-    )
-
-    if failed_count > max_failures:
-        logger.warning(
-            "High failure rate: %d/%d frames failed alignment",
-            failed_count, n_frames
-        )
-
-    return aligned_frames, all_results, validity_masks
