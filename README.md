@@ -288,6 +288,31 @@ For detailed algorithm descriptions, see [METHODS.md](docs/METHODS.md).
 
 
 
+## 🌗 Showcase — Partial Solar Eclipse of 2026-08-12
+
+The pipeline processed the partial solar eclipse (magnitude 0.93) observed
+with a DWARF 3 from the Viaduc des Fauvettes (Essonne, France): 79 tracked
+bursts, 1,580 raw FITS frames, from first contact to sunset in the trees.
+
+- **Observations** (timelapse, sky-path montage, measured-vs-predicted
+  obscuration): https://eclipse-fauvettes-observed.pages.dev
+- **Companion simulator** (Besselian elements, terrain and vegetation
+  horizon): https://eclipse-fauvettes.pages.dev
+
+Measured obscuration agreed with the simulation to an RMS deviation of
+0.006, with maximum 92.0% observed vs 92.1% predicted.
+
+Solar processing lives in `scripts/`:
+
+| Script | Role |
+|---|---|
+| `scripts/process_eclipse.py` | Per-burst solar masters: pedestal-aware lit-mask, disc-centroid registration (translation only), sigma-clipped stack, fixed-radius RANSAC disc fit, simulation-interpolated circumstances. Near the tree line the stack depth drops automatically (20 → 5 frames) so wind-blown foliage stays sharp. |
+| `scripts/eclipse_video.py` | Timelapse assembly with time stamp and obscuration gauge |
+| `scripts/eclipse_montage.py` | Discs composited along their true alt/az path over a calibrated landscape photograph |
+| `scripts/eclipse_agreement.py` | Observed-vs-simulated obscuration dataset and statistics |
+
+
+
 ## 🌌 M31 Complete Pipeline Example
 
 For long alt-az sessions with significant field rotation (e.g., M31 over 2.5 hours with ~87° rotation), use the debayer-first workflow with mask-aware stacking:

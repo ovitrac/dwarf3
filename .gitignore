@@ -260,3 +260,5 @@ secrets.json
 credentials.json
 .env.local
 .env.*.local
+# CloakMCP session artifacts
+.cloak-session-audit.jsonl
